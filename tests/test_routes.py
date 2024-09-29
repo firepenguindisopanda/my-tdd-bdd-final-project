@@ -28,10 +28,13 @@ import os
 import logging
 from decimal import Decimal
 from unittest import TestCase
+from urllib.parse import quote_plus
 from service import app
 from service.common import status
 from service.models import db, init_db, Product
 from tests.factories import ProductFactory
+from flask import Flask
+from service.common.log_handlers import init_logging
 
 # Disable all but critical errors during normal test run
 # uncomment for debugging failing tests
@@ -178,3 +181,180 @@ class TestProductRoutes(TestCase):
         data = response.get_json()
         # logging.debug("data = %s", data)
         return len(data)
+
+    def test_get_product(self):
+        """It should Read a single Product"""
+        # First, create a product
+        test_product = self._create_products(1)[0]
+
+        # Now, read the product we just created
+        response = self.client.get(f"{BASE_URL}/{test_product.id}")
+        
+        # Assert that the status code is 200 OK
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Get the response data and check it matches the created product
+        data = response.get_json()
+        self.assertEqual(data["name"], test_product.name)
+        self.assertEqual(data["description"], test_product.description)
+        self.assertEqual(Decimal(data["price"]), test_product.price)
+        self.assertEqual(data["available"], test_product.available)
+        self.assertEqual(data["category"], test_product.category.name)
+
+    def test_get_product_not_found(self):
+        """It should not Get a Product thats not found"""
+        response = self.client.get(f"{BASE_URL}/0")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        data = response.get_json()
+        self.assertIn("was not found", data["message"])
+
+    def test_update_product(self):
+        """It should Update an existing Product"""
+        # create a product to update
+        test_product = ProductFactory()
+        response = self.client.post(BASE_URL, json=test_product.serialize())
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        # update the product
+        new_product = response.get_json()
+        new_product["description"] = "unknown"
+        response = self.client.put(f"{BASE_URL}/{new_product['id']}", json=new_product)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        updated_product = response.get_json()
+        self.assertEqual(updated_product["description"], "unknown")
+    def test_update_nonexistent_product(self):
+        """It should not Update a Product that does not exist"""
+        invalid_product_id = 9999
+        test_product = ProductFactory()
+        updated_data = test_product.serialize()
+        updated_data["description"] = "updated description"
+        response = self.client.put(f"{BASE_URL}/{invalid_product_id}", json=updated_data)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        data = response.get_json()
+        self.assertEqual(data["message"], "Product not found")
+
+    def test_delete_product(self):
+        """It should Delete a Product"""
+        products = self._create_products(5)
+        product_count = self.get_product_count()
+        test_product = products[0]
+        response = self.client.delete(f"{BASE_URL}/{test_product.id}")
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertEqual(len(response.data), 0)
+        response = self.client.get(f"{BASE_URL}/{test_product.id}")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        new_count = self.get_product_count()
+        self.assertEqual(new_count, product_count - 1)
+
+    def test_delete_nonexistent_product(self):
+        """It should return 204 when trying to delete a non-existent Product"""
+        response = self.client.delete(f"{BASE_URL}/9999")
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        data = response.get_json()
+        self.assertEqual(None, data)
+
+    def test_query_by_name(self):
+        """It should Query Products by name"""
+        products = self._create_products(5)
+        test_name = products[0].name
+        name_count = len([product for product in products if product.name == test_name])
+        response = self.client.get(
+            BASE_URL, query_string=f"name={quote_plus(test_name)}"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.get_json()
+        self.assertEqual(len(data), name_count)
+        # check the data just to be sure
+        for product in data:
+            self.assertEqual(product["name"], test_name)
+
+    def test_query_by_category(self):
+        """It should Query Products by category"""
+        products = self._create_products(10)
+        category = products[0].category
+        found = [product for product in products if product.category == category]
+        found_count = len(found)
+        logging.debug("Found Products [%d] %s", found_count, found)
+        # test for available
+        response = self.client.get(BASE_URL, query_string=f"category={category.name}")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.get_json()
+        self.assertEqual(len(data), found_count)
+        # check the data just to be sure
+        for product in data:
+            self.assertEqual(product["category"], category.name)
+
+    def test_query_by_availability(self):
+        """It should Query Products by availability"""
+        products = self._create_products(10)
+        available_products = [product for product in products if product.available is True]
+        available_count = len(available_products)        
+        # test for available
+        response = self.client.get(
+            BASE_URL, query_string="available=true"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.get_json()
+        self.assertEqual(len(data), available_count)
+        # check the data just to be sure
+        for product in data:
+            self.assertEqual(product["available"], True)
+
+    def test_query_by_nonexistent_name(self):
+        """It should return an empty list when querying by a nonexistent product name"""
+        products = self._create_products(5)
+        nonexistent_name = "NonexistentProductName"
+        
+        response = self.client.get(
+            BASE_URL, query_string=f"name={quote_plus(nonexistent_name)}"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        
+        data = response.get_json()
+        self.assertEqual(len(data), 0, f"Expected no products, but got {len(data)}")
+        
+        self.assertListEqual(data, [])
+
+    def test_query_by_invalid_category(self):
+        """It should return an empty list when querying by an invalid category"""
+        invalid_category = "InvalidCategory"
+        response = self.client.get(
+            BASE_URL, query_string=f"category={quote_plus(invalid_category)}"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.get_json()
+        self.assertEqual(len(data), 0, f"Expected no products, but got {len(data)}")
+        self.assertListEqual(data, [])
+
+    def test_query_by_invalid_availability(self):
+        """It should return an empty list or handle invalid availability values gracefully"""
+        invalid_availability = "maybe"
+        response = self.client.get(
+            BASE_URL, query_string=f"available={quote_plus(invalid_availability)}"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.get_json()
+        self.assertEqual(len(data), 0, f"Expected no products, but got {len(data)}")
+        self.assertListEqual(data, [])
+
+    def test_method_not_allowed(self):
+        """It should return 405 Method Not Allowed"""
+        response = self.client.post(BASE_URL)
+        self.assertEqual(response.status_code, status.HTTP_415_UNSUPPORTED_MEDIA_TYPE)
+        data = response.get_json()
+        self.assertEqual(data['status'], status.HTTP_415_UNSUPPORTED_MEDIA_TYPE)
+        self.assertTrue('message' in data)
+
+    def test_logging_formatter_applied(self):
+        """It should apply the correct formatter to the logger handlers"""
+        app = Flask(__name__)
+        logger_name = 'gunicorn.error'
+        gunicorn_logger = logging.getLogger(logger_name)
+        test_handler = logging.StreamHandler()
+        gunicorn_logger.addHandler(test_handler)
+        gunicorn_logger.setLevel(logging.INFO)
+        init_logging(app, logger_name)
+        for handler in app.logger.handlers:
+            self.assertIsNotNone(handler.formatter, "Handler does not have a formatter applied")
+            expected_format = "[%(asctime)s] [%(levelname)s] [%(module)s] %(message)s"
+            self.assertEqual(handler.formatter._fmt, expected_format, "Incorrect log format applied")
+        gunicorn_logger.removeHandler(test_handler)
